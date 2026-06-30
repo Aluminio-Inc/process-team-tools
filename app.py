@@ -113,6 +113,11 @@ def init_db(conn: sqlite3.Connection) -> None:
             name TEXT PRIMARY KEY
         );
     """)
+    # Add category column to failure_cells if upgrading from old schema
+    fc_cols = [r[1] for r in conn.execute("PRAGMA table_info(failure_cells)").fetchall()]
+    if "category" not in fc_cols:
+        conn.execute("ALTER TABLE failure_cells ADD COLUMN category TEXT")
+
     # Seed registries with defaults (ignore conflicts)
     for key, label in DEFAULT_FAILURE_LABELS.items():
         conn.execute(
@@ -186,15 +191,15 @@ def parse_failure_cells(raw: str) -> list[tuple[str, int]]:
 def upsert_failure_cells(
     conn: sqlite3.Connection,
     trial_id: int,
-    mode_cells: dict[str, list[tuple[str, int]]],
+    mode_cells: dict[str, list[tuple[str, int, str | None]]],
 ) -> None:
-    """mode_cells: {mode_key: [(cell, count), …]}"""
+    """mode_cells: {mode_key: [(cell, count, category), …]}"""
     conn.execute("DELETE FROM failure_cells WHERE trial_id=?", (trial_id,))
     for mode, cell_list in mode_cells.items():
-        for cell, cnt in cell_list:
+        for cell, cnt, cat in cell_list:
             conn.execute(
-                "INSERT INTO failure_cells (trial_id, failure_mode, cell, count) VALUES (?,?,?,?)",
-                (trial_id, mode, cell, cnt),
+                "INSERT INTO failure_cells (trial_id, failure_mode, cell, count, category) VALUES (?,?,?,?,?)",
+                (trial_id, mode, cell, cnt, cat),
             )
 
 
@@ -274,7 +279,7 @@ def seed_from_csv(conn: sqlite3.Connection) -> None:
         """, row_dict)
         tid = cur.lastrowid
         mode_cells = {
-            mode: parse_failure_cells(row_dict[mode])
+            mode: [(cell, cnt, None) for cell, cnt in parse_failure_cells(row_dict[mode])]
             for mode in DEFAULT_FAILURE_MODES
         }
         upsert_failure_cells(conn, tid, mode_cells)
@@ -321,12 +326,15 @@ def invalidate_cache() -> None:
 
 # ── cell-first picker ─────────────────────────────────────────────────────────
 # Session-state keys:
-#   cf_selected_cell          — which cell is currently open ("WB" or None)
-#   cf_{cell}_{mode_key}      — count (int) for a given cell × mode
+#   cf_selected_cell              — which cell is currently open ("WB" or None)
+#   cf_{cell}_{mode_key}          — count (int) for a given cell × mode
+#   cf_cat_{cell}_{mode_key}      — category str for a given cell × mode entry
 
 def _cf_key(cell: str, mode_key: str) -> str:
     return f"cf_{cell}_{mode_key}"
 
+def _cf_cat_key(cell: str, mode_key: str) -> str:
+    return f"cf_cat_{cell}_{mode_key}"
 
 def _cell_total(cell: str, failure_registry: dict) -> int:
     return sum(
@@ -337,9 +345,8 @@ def _cell_total(cell: str, failure_registry: dict) -> int:
 
 def cell_first_picker(failure_registry: dict) -> None:
     """
-    One shared 4×5 grid. Clicking a cell selects it and reveals a panel
-    below the grid with a ± stepper for every failure mode.
-    Active cells show their total failure count as a badge.
+    Step 1 — 4×5 grid: click a cell to open its failure count panel.
+    Step 2 — Categorize: for every non-zero entry assign point/line/multicell.
     """
     selected = st.session_state.get("cf_selected_cell")
 
@@ -373,7 +380,6 @@ def cell_first_picker(failure_registry: dict) -> None:
 
             if cols[i + 1].button(label_btn, key=f"cfbtn_{cell}",
                                   use_container_width=True):
-                # Toggle: clicking the open cell closes it
                 st.session_state["cf_selected_cell"] = None if is_open else cell
                 st.rerun()
 
@@ -383,14 +389,13 @@ def cell_first_picker(failure_registry: dict) -> None:
         st.caption("Use − / + to set the count for each failure mode.")
 
         mode_keys = list(failure_registry.keys())
-        # Lay out modes in rows of 3
         for row_start in range(0, len(mode_keys), 3):
             chunk = mode_keys[row_start: row_start + 3]
             detail_cols = st.columns(3)
             for j, mk in enumerate(chunk):
                 with detail_cols[j]:
-                    skey  = _cf_key(selected, mk)
-                    cur   = st.session_state.get(skey, 0)
+                    skey = _cf_key(selected, mk)
+                    cur  = st.session_state.get(skey, 0)
                     st.markdown(
                         f"<div style='font-size:0.82em;font-weight:600;"
                         f"margin-bottom:2px'>{failure_registry[mk]}</div>",
@@ -430,25 +435,61 @@ def cell_first_picker(failure_registry: dict) -> None:
     else:
         st.caption("No failures recorded yet.")
 
+    # ── Step 2: categorize each non-zero entry ────────────────────────────────
+    # Build list of (cell, mode_key, count) that have been filled in
+    active_entries = []
+    for mk in failure_registry:
+        for cell in ALL_CELLS:
+            cnt = st.session_state.get(_cf_key(cell, mk), 0)
+            if cnt > 0:
+                active_entries.append((cell, mk, cnt))
+
+    if active_entries:
+        st.markdown("#### Categorize Failures")
+        st.caption(
+            "For each recorded failure, select whether it is a **point** defect "
+            "(single cell), **line** defect (whole column), or **multicell** defect."
+        )
+        cat_options = ["point", "line", "multicell"]
+
+        for row_start in range(0, len(active_entries), 2):
+            chunk = active_entries[row_start: row_start + 2]
+            cat_cols = st.columns(2)
+            for j, (cell, mk, cnt) in enumerate(chunk):
+                ckey = _cf_cat_key(cell, mk)
+                cur_cat = st.session_state.get(ckey, "point")
+                cur_idx = cat_options.index(cur_cat) if cur_cat in cat_options else 0
+                with cat_cols[j]:
+                    chosen = st.radio(
+                        f"**{failure_registry[mk]}** at {cell} (×{cnt})",
+                        options=cat_options,
+                        format_func=lambda x: {"point": "Point", "line": "Line", "multicell": "Multicell"}[x],
+                        index=cur_idx,
+                        key=f"catradio_{cell}_{mk}",
+                        horizontal=True,
+                    )
+                    st.session_state[ckey] = chosen
+
 
 def clear_cell_first_picker(failure_registry: dict) -> None:
     st.session_state["cf_selected_cell"] = None
     for cell in ALL_CELLS:
         for mk in failure_registry:
-            key = _cf_key(cell, mk)
-            if key in st.session_state:
-                del st.session_state[key]
+            for key in (_cf_key(cell, mk), _cf_cat_key(cell, mk)):
+                if key in st.session_state:
+                    del st.session_state[key]
 
 
-def collect_mode_cells(failure_registry: dict) -> dict[str, list[tuple[str, int]]]:
-    """Return {mode_key: [(cell, count), …]} from current picker state."""
-    result: dict[str, list[tuple[str, int]]] = {}
+def collect_mode_cells(failure_registry: dict) -> dict[str, list[tuple[str, int, str | None]]]:
+    """Return {mode_key: [(cell, count, category), …]} from current picker state."""
+    result: dict[str, list[tuple[str, int, str | None]]] = {}
     for mk in failure_registry:
         entries = []
         for cell in ALL_CELLS:
             cnt = st.session_state.get(_cf_key(cell, mk), 0)
             if cnt > 0:
-                entries.append((cell, cnt))
+                cat = st.session_state.get(_cf_cat_key(cell, mk))
+                entries.append((cell, cnt, cat))
         result[mk] = entries
     return result
 
